@@ -9,9 +9,6 @@ from datetime import datetime
 import numpy as np
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
-from anthropic import Anthropic, AuthenticationError, APIStatusError
-
-MODEL = "claude-sonnet-5"
 
 st.set_page_config(page_title="Catalog Refinery", page_icon="\U0001F4E6", layout="wide")
 
@@ -99,14 +96,6 @@ st.markdown(
 # API key handling
 # ---------------------------------------------------------------------------
 
-api_key = st.secrets.get("ANTHROPIC_API_KEY", "") if hasattr(st, "secrets") else ""
-if not api_key:
-    api_key = st.sidebar.text_input("Anthropic API key", type="password", help="Stored only for this session.")
-if not api_key:
-    st.sidebar.warning("Add your Anthropic API key to continue.")
-
-client = Anthropic(api_key=api_key) if api_key else None
-
 # ---------------------------------------------------------------------------
 # Shared constants
 # ---------------------------------------------------------------------------
@@ -187,31 +176,252 @@ def compute_grade(field_ratios):
     return grade, msg
 
 
-def call_claude_json(prompt, max_tokens=1000):
-    resp = client.messages.create(
-        model=MODEL,
-        max_tokens=max_tokens,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    text = "".join(block.text for block in resp.content if hasattr(block, "text")).strip()
-    clean = re.sub(r"^```json\s*|^```\s*|```$", "", text).strip()
-    return json.loads(clean)
+# ---------------------------------------------------------------------------
+# Rule-based text generation (no external API — everything below is
+# deterministic string processing over what the person typed in)
+# ---------------------------------------------------------------------------
+
+STOPWORDS = {
+    "a", "an", "the", "for", "with", "and", "or", "of", "in", "on", "to", "is",
+    "are", "this", "that", "these", "those", "it", "its", "your", "our", "you",
+    "we", "at", "by", "from", "as", "be", "was", "were", "will", "can", "has",
+    "have", "had", "not", "no", "but", "so", "than", "then", "into", "up",
+    "out", "if", "all", "each", "per",
+}
+
+RISKY_TERMS = re.compile(
+    r"\b(cure|cures|cured|treat|treats|treating|treatment|disease|diagnos\w*|"
+    r"prevent\w*|cancer|diabetes|arthritis|tumou?r|heart disease|blood pressure|"
+    r"inflammation|infection)\b",
+    re.IGNORECASE,
+)
+
+MATERIAL_KEYWORDS = [
+    "cotton", "nylon", "silicone", "stainless steel", "polyester", "leather",
+    "bamboo", "plastic", "wood", "glass", "ceramic", "rubber", "wool", "linen",
+    "ABS plastic", "aluminum", "ripstop", "neoprene", "spandex", "fleece",
+]
+CARE_KEYWORDS = [
+    "machine washable", "hand wash", "wipe clean", "dishwasher safe",
+    "air dry", "spot clean", "reusable", "disposable",
+]
+
+THEME_TAGLINES = {
+    "baby_swim": "Made for splashing and everyday play",
+    "baby": "Designed for cozy, everyday comfort",
+    "swim": "Built for pool days and beyond",
+    "outdoor": "Ready for the trail and beyond",
+    "kitchen": "A staple for everyday cooking",
+    "fitness": "Built to keep up with you",
+    "tech": "Designed to fit your everyday routine",
+    "beauty": "A simple step in your daily routine",
+    "general": "Made for real, everyday use",
+}
 
 
-def friendly_error_message(e):
-    if isinstance(e, AuthenticationError):
-        return (
-            "Anthropic rejected this API key. Double check it's a key from "
-            "console.anthropic.com (Settings \u2192 API Keys, starts with `sk-ant-`) "
-            "copied in full, and that it hasn't been revoked or rotated."
-        )
-    if isinstance(e, APIStatusError) and e.status_code == 429:
-        return "Rate limit or usage cap hit on this API key. Wait a moment and try again, or check usage limits in the Anthropic console."
-    if isinstance(e, APIStatusError) and e.status_code in (500, 502, 503, 529):
-        return "Anthropic's API is temporarily unavailable. This usually clears up in a minute \u2014 try again shortly."
-    if isinstance(e, json.JSONDecodeError):
-        return "Claude's response couldn't be parsed as JSON. This is usually transient \u2014 try generating again."
-    return str(e)
+def strip_separators(text):
+    text = re.sub(r"[\-\u2013\u2014|]+", " ", text or "")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def split_sentences(text):
+    return [s.strip() for s in re.split(r"(?<=[.!?])\s+", (text or "").strip()) if s.strip()]
+
+
+def split_lines(text):
+    return [l.strip(" \t\u2022-\u2013\u2014*") for l in (text or "").splitlines() if l.strip()]
+
+
+def dedupe_words_preserve_order(words):
+    seen, out = set(), []
+    for w in words:
+        key = w.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(w)
+    return out
+
+
+def truncate_at_word(text, max_len):
+    text = (text or "").strip()
+    if len(text) <= max_len:
+        return text
+    cut = text[:max_len].rsplit(" ", 1)[0]
+    return cut.rstrip(",.;:- ") or text[:max_len]
+
+
+def truncate_bytes_at_word(text, max_bytes):
+    text = (text or "").strip()
+    if byte_len(text) <= max_bytes:
+        return text
+    words, out, total = text.split(" "), [], 0
+    for w in words:
+        wb = byte_len(w) + (1 if out else 0)
+        if total + wb > max_bytes:
+            break
+        out.append(w)
+        total += wb
+    return " ".join(out)
+
+
+def apply_regulated_filter(sentences, regulated):
+    if not regulated:
+        return sentences, False
+    kept, flagged = [], False
+    for s in sentences:
+        if RISKY_TERMS.search(s):
+            flagged = True
+        else:
+            kept.append(s)
+    return kept, flagged
+
+
+def clean_word(w):
+    return re.sub(r"^[^\w]+|[^\w]+$", "", w)
+
+
+def build_title(brand, packsize, category, old_title, old_bullets, extra_keywords, title_max):
+    base_words = [clean_word(w) for w in strip_separators(old_title).split()]
+    base_words = [w for w in base_words if w]
+    extra_words = [clean_word(w) for w in strip_separators(extra_keywords).split() if clean_word(w)]
+    bullet_words = [clean_word(w) for w in strip_separators(" ".join(old_bullets)).split() if clean_word(w)]
+
+    brand_lower = (brand or "").lower()
+    body_words = [w for w in base_words if w.lower() != brand_lower]
+    body_words = dedupe_words_preserve_order(body_words)
+
+    if len(" ".join(body_words)) < title_max * 0.6:
+        for w in extra_words + bullet_words:
+            if w.lower() in {x.lower() for x in body_words} or w.lower() == brand_lower:
+                continue
+            body_words.append(w)
+            if len(" ".join(body_words)) >= title_max * 0.85:
+                break
+
+    parts = ([brand] if brand else []) + body_words + ([packsize] if packsize else [])
+    title = " ".join(dedupe_words_preserve_order(parts))
+    title = re.sub(r"\s+", " ", title).strip()
+    return truncate_at_word(title, title_max)
+
+
+def build_bullets(old_bullets, description, extra_keywords, bullet_max, regulated):
+    pool = list(old_bullets)
+    pool += split_sentences(description)
+    if extra_keywords.strip():
+        pool += [p.strip() for p in re.split(r"[,\n]", extra_keywords) if p.strip()]
+
+    pool, _ = apply_regulated_filter(pool, regulated)
+    pool = dedupe_words_preserve_order([p for p in pool if p])
+
+    bullets = []
+    for p in pool[:5]:
+        text = p[0].upper() + p[1:] if p else p
+        bullets.append(truncate_at_word(text, bullet_max))
+    return bullets
+
+
+def build_description(old_description, old_bullets, description_max, regulated):
+    if old_description.strip():
+        sentences = split_sentences(old_description)
+    else:
+        sentences = old_bullets
+    sentences, flagged = apply_regulated_filter(sentences, regulated)
+    text = " ".join(sentences)
+    text = re.sub(r"\s+", " ", text).strip()
+    return truncate_at_word(text, description_max), flagged
+
+
+def build_backend_terms(old_title, new_title, old_bullets, new_bullets, description, extra_keywords, backend_max_bytes):
+    used = set(w.lower() for w in strip_separators(new_title).split())
+    for b in new_bullets:
+        used.update(clean_word(w).lower() for w in strip_separators(b).split())
+
+    candidates = []
+    for source in [old_title] + old_bullets + [description, extra_keywords]:
+        for w in strip_separators(source).split():
+            wl = clean_word(w).lower()
+            if len(wl) < 3 or wl in STOPWORDS or wl in used:
+                continue
+            candidates.append(wl)
+
+    candidates = dedupe_words_preserve_order(candidates)
+    terms = " ".join(candidates)
+    return truncate_bytes_at_word(terms, backend_max_bytes)
+
+
+def build_listing_rulebased(brand, packsize, category, old_title, old_bullets_raw, old_description, extra_keywords, regulated, lim):
+    old_bullets_all = split_lines(old_bullets_raw)
+    old_bullets, bullets_flagged = apply_regulated_filter(old_bullets_all, regulated)
+
+    safe_title = old_title
+    safe_extra = extra_keywords
+    other_flagged = False
+    if regulated:
+        if RISKY_TERMS.search(old_title or ""):
+            safe_title = re.sub(r"\s+", " ", RISKY_TERMS.sub("", old_title)).strip()
+            other_flagged = True
+        if RISKY_TERMS.search(extra_keywords or ""):
+            safe_extra = re.sub(r"\s+", " ", RISKY_TERMS.sub("", extra_keywords)).strip()
+            other_flagged = True
+
+    title = build_title(brand, packsize, category, safe_title, old_bullets, safe_extra, lim["title_max"])
+
+    item_highlights = ""
+    if lim["highlight_max"]:
+        leftover = strip_separators(" ".join(old_bullets) + " " + safe_extra)
+        item_highlights = truncate_at_word(leftover, lim["highlight_max"])
+
+    bullets = build_bullets(old_bullets, old_description, safe_extra, lim["bullet_max"], regulated)
+    description, desc_flagged = build_description(old_description, old_bullets, lim["description_max"], regulated)
+    backend_terms = build_backend_terms(safe_title, title, old_bullets, bullets, description, safe_extra, lim["backend_max_bytes"])
+
+    flagged = desc_flagged or bullets_flagged or other_flagged
+    return {
+        "title": title,
+        "item_highlights": item_highlights,
+        "bullets": bullets,
+        "description": description,
+        "backend_terms": backend_terms,
+    }, flagged
+
+
+def build_image_content_rulebased(brand, category, packsize, bullets_text, description_text, title_text, theme_key):
+    bullets = [b for b in re.split(r"\s*\|\s*|\n", bullets_text) if b.strip()]
+    sentences = split_sentences(description_text)
+    blob = " ".join([bullets_text, description_text, title_text]).lower()
+
+    callouts = []
+    for b in bullets[:6]:
+        words = strip_separators(b).split()[:4]
+        if words:
+            callouts.append(" ".join(w.capitalize() if i == 0 else w for i, w in enumerate(words)))
+    while len(callouts) < 6:
+        callouts.append("")
+
+    material = next((m for m in MATERIAL_KEYWORDS if m in blob), "\u2014")
+    care = next((c for c in CARE_KEYWORDS if c in blob), "\u2014")
+    spec_items = [
+        {"label": "Size", "value": packsize or "\u2014"},
+        {"label": "Material", "value": material.capitalize()},
+        {"label": "Use", "value": category.replace("_", " ").title() if category else "\u2014"},
+        {"label": "Care", "value": care.capitalize()},
+        {"label": "Pack", "value": packsize or "\u2014"},
+        {"label": "Brand", "value": brand or "\u2014"},
+    ]
+
+    supporting_line = sentences[0] if sentences else (bullets[0] if bullets else "")
+    supporting_line = truncate_at_word(supporting_line, 90)
+
+    lifestyle_tagline = THEME_TAGLINES.get(theme_key, THEME_TAGLINES["general"])
+    size_guide_label = packsize if packsize else "True-to-size fit"
+
+    return {
+        "feature_callouts": callouts,
+        "spec_items": spec_items,
+        "supporting_line": supporting_line,
+        "lifestyle_tagline": lifestyle_tagline,
+        "size_guide_label": size_guide_label,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -286,48 +496,29 @@ with tab_listing:
             old_description = st.text_area("Old description (optional)", key="old_description", height=100)
             extra_keywords = st.text_area("Known keywords / features (optional)", key="extra_keywords", height=80)
 
-            generate_clicked = st.button("Refine listing", type="primary", use_container_width=True, disabled=not client)
+            generate_clicked = st.button("Refine listing", type="primary", use_container_width=True)
 
     if generate_clicked:
-        instructions = f"""You are an Amazon catalog optimization specialist. Rewrite this listing to comply with Amazon's current style guide and maximize A9/A10 indexing, while staying strictly within these hard limits:
-- Title: at most {lim['title_max']} characters.{f" Item Highlights (separate field, materials/use-cases/comparison info): at most {lim['highlight_max']} characters." if lim['highlight_max'] else " No separate Item Highlights field is used in legacy mode; return item_highlights as an empty string."}
-- Exactly 5 bullet points, each at most {lim['bullet_max']} characters, benefit-led (lead with the customer benefit, then the supporting feature), no keyword stuffing, no repeated root keywords across bullets.
-- Description: 1200-1600 characters (hard cap {lim['description_max']}), plain text only (no HTML tags), 2-3 short paragraphs, does not just repeat the bullets verbatim.
-- Backend search terms: a single space-separated string, at most {lim['backend_max_bytes']} bytes (UTF-8), no commas, no punctuation, no repeated words already used in the title or bullets, no brand or competitor names, include synonyms/use-cases/spanish terms where relevant.
-
-Do not use subjective superlatives ("best", "#1", "guaranteed"), pricing or promotional claims ("free shipping", "sale"), URLs, emojis, or excessive punctuation. Do not put the brand name or generic filler in backend terms. The title must start with the brand name, followed by the product's key descriptive keywords in order of importance. Do not use hyphens, dashes, or pipe characters ("-", "\u2013", "\u2014", "|") anywhere in the title as separators \u2014 separate ideas with spaces or commas only."""
-
-        if regulated:
-            instructions += """
-
-This is a regulated / dietary supplement listing. Use compliant structure-function language only. Do NOT reference any disease, medical condition, or diagnosis, and do NOT claim to treat, cure, prevent, or diagnose anything, or claim to affect the structure or function of a specific organ or body system. Focus on general wellness support language instead."""
-
-        instructions += """
-
-Respond with ONLY minified JSON, no markdown fences, no commentary, matching exactly this schema:
-{"title":"...","item_highlights":"...","bullets":["...","...","...","...","..."],"description":"...","backend_terms":"..."}"""
-
-        product_context = f"""
-Brand: {brand or '(not provided)'}
-Pack / size / count: {packsize or '(not provided)'}
-Category: {category}
-Old title: {old_title or '(none provided)'}
-Old bullets: {old_bullets or '(none provided)'}
-Old description: {old_description or '(none provided)'}
-Additional known keywords / features: {extra_keywords or '(none provided)'}
-"""
-
         with st.spinner("Refining listing..."):
             try:
-                parsed = call_claude_json(instructions + "\n\n" + product_context)
+                parsed, desc_flagged = build_listing_rulebased(
+                    brand, packsize, category, old_title, old_bullets, old_description,
+                    extra_keywords, regulated, lim,
+                )
                 if st.session_state.listing:
                     st.session_state.history.insert(0, {
                         "stamp": datetime.now().strftime("%H:%M:%S"),
                         "data": st.session_state.listing,
                     })
                 st.session_state.listing = parsed
+                if desc_flagged:
+                    st.warning(
+                        "One or more sentences were dropped from the description because they mentioned "
+                        "a disease, condition, or treatment claim \u2014 review the regulated listing manually "
+                        "before publishing."
+                    )
             except Exception as e:
-                st.error(f"Could not generate the listing. {friendly_error_message(e)}")
+                st.error(f"Could not generate the listing. {e}")
 
     with right:
         out_card = st.container(border=True)
@@ -972,7 +1163,7 @@ with tab_imagery:
             )
             generate_images_clicked = st.button(
                 "Generate image set", type="primary", use_container_width=True,
-                disabled=not (client and raw_file),
+                disabled=not raw_file,
             )
 
     if generate_images_clicked and raw_file:
@@ -994,23 +1185,9 @@ with tab_imagery:
                 theme_key = detect_theme(theme_choice, brand_val, category_val, bullets_text, description_text, title_text, extra_val)
                 persona_key = detect_persona(persona_choice, theme_key, brand_val, category_val, bullets_text, description_text, title_text, extra_val)
 
-                content_prompt = f"""You are writing short on-image copy for Amazon secondary product images (infographics, not the compliant main image). Given this product context, respond with ONLY minified JSON, no markdown, matching exactly:
-{{"feature_callouts":["...","...","...","...","...","..."],"spec_items":[{{"label":"...","value":"..."}},{{"label":"...","value":"..."}},{{"label":"...","value":"..."}},{{"label":"...","value":"..."}},{{"label":"...","value":"..."}},{{"label":"...","value":"..."}}],"supporting_line":"...","lifestyle_tagline":"...","size_guide_label":"..."}}
-
-Rules: feature_callouts are 6 short phrases, 2-5 words each, benefit-first, no punctuation at the end, no repeats. spec_items are 6 short label/value pairs (e.g. Size, Material, Use, Care, Pack, Fit, Age range, Safety, or category-appropriate equivalents) drawn from the product context, values under 4 words. supporting_line is one short sentence (8-14 words) that adds real detail beyond the callouts, no punctuation at the end. lifestyle_tagline is a short 4-7 word phrase evoking real use of the product, no claims, no punctuation at the end. size_guide_label is a short 2-5 word phrase about fit or scale. Do not invent specific numeric dimensions or claims not implied by the context.
-
-Brand: {brand_val or '(not provided)'}
-Category: {category_val}
-Pack / size: {packsize_val or '(not provided)'}
-Bullets or features: {bullets_text or '(none provided)'}
-Description: {description_text or '(none provided)'}"""
-
-                try:
-                    content = call_claude_json(content_prompt)
-                except Exception as e:
-                    content = {"feature_callouts": [], "spec_items": [], "supporting_line": "",
-                               "lifestyle_tagline": "", "size_guide_label": ""}
-                    st.warning(f"Using generic placeholder text on the infographics \u2014 {friendly_error_message(e)}")
+                content = build_image_content_rulebased(
+                    brand_val, category_val, packsize_val, bullets_text, description_text, title_text, theme_key,
+                )
 
                 sku = re.sub(r"[^a-zA-Z0-9]", "", sku_input) or "product"
                 theme = cutout["theme"]
@@ -1035,7 +1212,8 @@ Description: {description_text or '(none provided)'}"""
 
                 st.session_state.imagery = images
             except Exception as e:
-                st.error(f"Could not generate the image set. {friendly_error_message(e)}")
+                st.error(f"Could not generate the image set. {e}")
+
 
     with right:
         out_img_card = st.container(border=True)
