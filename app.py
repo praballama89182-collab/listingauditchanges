@@ -9,7 +9,7 @@ from datetime import datetime
 import numpy as np
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
-from anthropic import Anthropic
+from anthropic import Anthropic, AuthenticationError, APIStatusError
 
 MODEL = "claude-sonnet-5"
 
@@ -21,24 +21,79 @@ st.set_page_config(page_title="Catalog Refinery", page_icon="\U0001F4E6", layout
 
 st.markdown(
     """
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@500;600&display=swap" rel="stylesheet">
     <style>
-    .stApp { background: #F6F5F1; }
-    h1, h2, h3 { font-family: 'Georgia', serif; color: #131A22; }
+    :root{
+        --navy:#131A22; --navy-2:#1E2733; --amber:#E8971A; --amber-dark:#8A5A0C;
+        --paper:#F6F5F1; --ink:#1C1F26; --muted:#6B7280; --line:#E3E1D8;
+        --success:#0F7B5D; --success-bg:#E4F3EC; --warn:#B8860B; --warn-bg:#FBF1DC;
+        --danger:#C4432B; --danger-bg:#FBEAE5;
+    }
+    .stApp { background: var(--paper); font-family:'Inter',sans-serif; }
+    h1, h2, h3 { font-family:'Space Grotesk',sans-serif !important; color: var(--navy) !important; }
+    [data-testid="stHeader"] { background: transparent; }
+    .block-container { padding-top: 1.2rem; max-width: 1320px; }
+
+    .crHeader{
+        background:var(--navy); color:#fff; padding:20px 28px; border-radius:12px;
+        border-bottom:3px solid var(--amber); display:flex; align-items:center; gap:14px;
+        margin-bottom:22px;
+    }
+    .crCrate{
+        width:38px; height:38px; border:2px solid var(--amber); border-radius:6px;
+        display:flex; align-items:center; justify-content:center; font-family:'Space Grotesk',sans-serif;
+        font-weight:700; color:var(--amber); font-size:15px; flex-shrink:0;
+    }
+    .crHeader h1{ color:#fff !important; font-size:21px; margin:0; }
+    .crHeader p{ margin:2px 0 0; font-size:12.5px; color:#B8C0CC; }
+
+    .crSection{
+        font-family:'Space Grotesk',sans-serif; font-size:12px; font-weight:700;
+        text-transform:uppercase; letter-spacing:0.8px; color:var(--navy);
+        display:flex; align-items:center; gap:8px; margin:0 0 12px;
+    }
+    .crSection::before{ content:""; width:8px; height:8px; background:var(--amber); border-radius:2px; }
+
     .crBadge { display:inline-block; padding:2px 10px; border-radius:10px; font-size:11px;
-        font-family: monospace; font-weight:600; }
-    .crGood { background:#E4F3EC; color:#0F7B5D; }
-    .crWarn { background:#FBF1DC; color:#B8860B; }
-    .crBad  { background:#FBEAE5; color:#C4432B; }
+        font-family:'IBM Plex Mono',monospace; font-weight:600; }
+    .crGood { background:var(--success-bg); color:var(--success); }
+    .crWarn { background:var(--warn-bg); color:var(--warn); }
+    .crBad  { background:var(--danger-bg); color:var(--danger); }
     .crGradeCircle { display:inline-flex; align-items:center; justify-content:center;
-        width:44px; height:44px; border-radius:50%; background:#E8971A; color:#221400;
-        font-weight:700; font-size:18px; }
+        width:44px; height:44px; border-radius:50%; background:var(--amber); color:#221400;
+        font-weight:700; font-size:18px; font-family:'Space Grotesk',sans-serif; flex-shrink:0; }
+    .crGradeCard{
+        background:var(--navy); border-radius:10px; padding:14px 18px; margin-top:10px;
+        display:flex; align-items:center; gap:14px;
+    }
+    .crGradeCard .crMsg{ color:#B8C0CC; font-size:13px; }
+    .crGradeCard .crMsg b{ color:#fff; display:block; font-size:14px; font-family:'Space Grotesk',sans-serif; }
+
+    div[data-testid="stVerticalBlockBorderWrapper"]{ border-radius:10px !important; }
+    .stButton > button[kind="primary"]{
+        background:var(--amber); border-color:var(--amber); color:#221400; font-weight:700;
+        font-family:'Space Grotesk',sans-serif;
+    }
+    .stButton > button[kind="primary"]:hover{ background:var(--amber-dark); border-color:var(--amber-dark); color:#fff; }
+    .stTabs [data-baseweb="tab"]{ font-family:'Space Grotesk',sans-serif; font-weight:600; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-st.title("Catalog Refinery")
-st.caption("Amazon listing rewrite, compliance check, and a 5-image set generator — from raw product content and a raw photo.")
+st.markdown(
+    """
+    <div class="crHeader">
+        <div class="crCrate">CR</div>
+        <div>
+            <h1>Catalog Refinery</h1>
+            <p>Amazon listing rewrite, compliance check, and a 5-image set generator — from raw product content and a raw photo.</p>
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 # ---------------------------------------------------------------------------
 # API key handling
@@ -79,6 +134,14 @@ THEME_LABELS = {
     "tech": "Tech & electronics",
     "beauty": "Beauty & wellness",
     "general": "General / minimal",
+}
+PERSONA_LABELS = {
+    "auto": "Auto-detect from brand/category/copy",
+    "baby": "Baby",
+    "man": "Man",
+    "woman": "Woman",
+    "adult": "Adult (neutral)",
+    "none": "No figure",
 }
 
 
@@ -135,6 +198,22 @@ def call_claude_json(prompt, max_tokens=1000):
     return json.loads(clean)
 
 
+def friendly_error_message(e):
+    if isinstance(e, AuthenticationError):
+        return (
+            "Anthropic rejected this API key. Double check it's a key from "
+            "console.anthropic.com (Settings \u2192 API Keys, starts with `sk-ant-`) "
+            "copied in full, and that it hasn't been revoked or rotated."
+        )
+    if isinstance(e, APIStatusError) and e.status_code == 429:
+        return "Rate limit or usage cap hit on this API key. Wait a moment and try again, or check usage limits in the Anthropic console."
+    if isinstance(e, APIStatusError) and e.status_code in (500, 502, 503, 529):
+        return "Anthropic's API is temporarily unavailable. This usually clears up in a minute \u2014 try again shortly."
+    if isinstance(e, json.JSONDecodeError):
+        return "Claude's response couldn't be parsed as JSON. This is usually transient \u2014 try generating again."
+    return str(e)
+
+
 # ---------------------------------------------------------------------------
 # Session state
 # ---------------------------------------------------------------------------
@@ -156,54 +235,58 @@ with tab_listing:
     left, right = st.columns([2, 3], gap="large")
 
     with left:
-        st.subheader("Product identity")
-        c1, c2 = st.columns(2)
-        brand = c1.text_input("Brand name", key="brand", placeholder="e.g. Biomed")
-        packsize = c2.text_input("Pack / size / count", key="packsize", placeholder="e.g. 2 fl oz, Pack of 3")
+        card = st.container(border=True)
+        with card:
+            st.markdown('<p class="crSection">Product identity</p>', unsafe_allow_html=True)
+            c1, c2 = st.columns(2)
+            brand = c1.text_input("Brand name", key="brand", placeholder="e.g. Biomed")
+            packsize = c2.text_input("Pack / size / count", key="packsize", placeholder="e.g. 2 fl oz, Pack of 3")
 
-        category = st.selectbox(
-            "Category", options=list(CATEGORY_LABELS.keys()),
-            format_func=lambda k: CATEGORY_LABELS[k], key="category",
-        )
+            category = st.selectbox(
+                "Category", options=list(CATEGORY_LABELS.keys()),
+                format_func=lambda k: CATEGORY_LABELS[k], key="category",
+            )
 
-        title_mode = st.radio(
-            "Title format", options=["new", "legacy"],
-            format_func=lambda v: "2026 rule (75 char + highlights)" if v == "new" else "Legacy (category limit)",
-            horizontal=True, key="title_mode",
-            disabled=(category == "media"),
-            index=1 if category == "media" else 0,
-        )
-        if category == "media":
-            title_mode = "legacy"
-            st.caption("Media titles are exempt from the 2026 75-character rule — using the legacy limit.")
+            title_mode = st.radio(
+                "Title format", options=["new", "legacy"],
+                format_func=lambda v: "2026 rule (75 char + highlights)" if v == "new" else "Legacy (category limit)",
+                horizontal=True, key="title_mode",
+                disabled=(category == "media"),
+                index=1 if category == "media" else 0,
+            )
+            if category == "media":
+                title_mode = "legacy"
+                st.caption("Media titles are exempt from the 2026 75-character rule — using the legacy limit.")
 
-        bullet_mode = st.radio(
-            "Bullet length target", options=["200", "255", "500"],
-            format_func=lambda v: {"200": "Concise (200)", "255": "Standard (255)", "500": "Extended (500, Brand Reg.)"}[v],
-            horizontal=True, key="bullet_mode",
-        )
+            bullet_mode = st.radio(
+                "Bullet length target", options=["200", "255", "500"],
+                format_func=lambda v: {"200": "Concise (200)", "255": "Standard (255)", "500": "Extended (500, Brand Reg.)"}[v],
+                horizontal=True, key="bullet_mode",
+            )
 
-        lim = limits_for(category, title_mode, bullet_mode)
-        readout = f"Applying: title \u2264 {lim['title_max']} chars"
-        if lim["highlight_max"]:
-            readout += f", item highlights \u2264 {lim['highlight_max']} chars"
-        if category == "media":
-            readout += " (media is exempt from the 2026 75-char rule)"
-        st.caption(readout)
+            lim = limits_for(category, title_mode, bullet_mode)
+            readout = f"Applying: title \u2264 {lim['title_max']} chars"
+            if lim["highlight_max"]:
+                readout += f", item highlights \u2264 {lim['highlight_max']} chars"
+            if category == "media":
+                readout += " (media is exempt from the 2026 75-char rule)"
+            st.caption(readout)
 
-        regulated = st.checkbox(
-            "Regulated / supplement listing — enforce structure-function language only, "
-            "no disease, cure, or organ-function claims.",
-            key="regulated",
-        )
+            regulated = st.checkbox(
+                "Regulated / supplement listing — enforce structure-function language only, "
+                "no disease, cure, or organ-function claims.",
+                key="regulated",
+            )
 
-        st.subheader("Current listing content")
-        old_title = st.text_area("Old title", key="old_title", height=70)
-        old_bullets = st.text_area("Old bullet points (one per line)", key="old_bullets", height=120)
-        old_description = st.text_area("Old description (optional)", key="old_description", height=100)
-        extra_keywords = st.text_area("Known keywords / features (optional)", key="extra_keywords", height=80)
+        card2 = st.container(border=True)
+        with card2:
+            st.markdown('<p class="crSection">Current listing content</p>', unsafe_allow_html=True)
+            old_title = st.text_area("Old title", key="old_title", height=70)
+            old_bullets = st.text_area("Old bullet points (one per line)", key="old_bullets", height=120)
+            old_description = st.text_area("Old description (optional)", key="old_description", height=100)
+            extra_keywords = st.text_area("Known keywords / features (optional)", key="extra_keywords", height=80)
 
-        generate_clicked = st.button("Refine listing", type="primary", use_container_width=True, disabled=not client)
+            generate_clicked = st.button("Refine listing", type="primary", use_container_width=True, disabled=not client)
 
     if generate_clicked:
         instructions = f"""You are an Amazon catalog optimization specialist. Rewrite this listing to comply with Amazon's current style guide and maximize A9/A10 indexing, while staying strictly within these hard limits:
@@ -244,69 +327,74 @@ Additional known keywords / features: {extra_keywords or '(none provided)'}
                     })
                 st.session_state.listing = parsed
             except Exception as e:
-                st.error(f"Could not generate the listing. {e}")
+                st.error(f"Could not generate the listing. {friendly_error_message(e)}")
 
     with right:
-        listing = st.session_state.listing
-        if not listing:
-            st.info(
-                "Fill in the manifest on the left and click Refine listing — your optimized title, "
-                "bullets, description, and backend search terms will appear here, each with a live "
-                "compliance gauge."
-            )
-        else:
-            title_val = st.text_area("Title", value=listing.get("title", ""), key="out_title", height=70)
-            title_count = len(title_val)
-            st.markdown(gauge_badge(title_count, lim["title_max"], "chars"), unsafe_allow_html=True)
-            ratios = [gauge_ratio(title_count, lim["title_max"])]
+        out_card = st.container(border=True)
+        with out_card:
+            st.markdown('<p class="crSection">Refined listing</p>', unsafe_allow_html=True)
+            listing = st.session_state.listing
+            if not listing:
+                st.info(
+                    "Fill in the manifest on the left and click Refine listing — your optimized title, "
+                    "bullets, description, and backend search terms will appear here, each with a live "
+                    "compliance gauge."
+                )
+            else:
+                title_val = st.text_area("Title", value=listing.get("title", ""), key="out_title", height=70)
+                title_count = len(title_val)
+                st.markdown(gauge_badge(title_count, lim["title_max"], "chars"), unsafe_allow_html=True)
+                ratios = [gauge_ratio(title_count, lim["title_max"])]
 
-            if lim["highlight_max"]:
-                hl_val = st.text_area("Item highlights", value=listing.get("item_highlights", ""), key="out_highlights", height=70)
-                hl_count = len(hl_val)
-                st.markdown(gauge_badge(hl_count, lim["highlight_max"], "chars"), unsafe_allow_html=True)
-                ratios.append(gauge_ratio(hl_count, lim["highlight_max"]))
+                if lim["highlight_max"]:
+                    hl_val = st.text_area("Item highlights", value=listing.get("item_highlights", ""), key="out_highlights", height=70)
+                    hl_count = len(hl_val)
+                    st.markdown(gauge_badge(hl_count, lim["highlight_max"], "chars"), unsafe_allow_html=True)
+                    ratios.append(gauge_ratio(hl_count, lim["highlight_max"]))
 
-            st.markdown("**Bullet points**")
-            bullets = listing.get("bullets", []) or [""] * 5
-            for i in range(5):
-                b_val = st.text_area(f"Bullet {i+1}", value=bullets[i] if i < len(bullets) else "", key=f"out_bullet_{i}", height=70)
-                b_count = len(b_val)
-                st.markdown(gauge_badge(b_count, lim["bullet_max"], "chars"), unsafe_allow_html=True)
-                ratios.append(gauge_ratio(b_count, lim["bullet_max"]))
+                st.markdown("**Bullet points**")
+                bullets = listing.get("bullets", []) or [""] * 5
+                for i in range(5):
+                    b_val = st.text_area(f"Bullet {i+1}", value=bullets[i] if i < len(bullets) else "", key=f"out_bullet_{i}", height=70)
+                    b_count = len(b_val)
+                    st.markdown(gauge_badge(b_count, lim["bullet_max"], "chars"), unsafe_allow_html=True)
+                    ratios.append(gauge_ratio(b_count, lim["bullet_max"]))
 
-            desc_val = st.text_area("Description", value=listing.get("description", ""), key="out_description", height=200)
-            desc_count = len(desc_val)
-            st.markdown(gauge_badge(desc_count, lim["description_max"], "chars"), unsafe_allow_html=True)
-            ratios.append(gauge_ratio(desc_count, lim["description_max"]))
+                desc_val = st.text_area("Description", value=listing.get("description", ""), key="out_description", height=200)
+                desc_count = len(desc_val)
+                st.markdown(gauge_badge(desc_count, lim["description_max"], "chars"), unsafe_allow_html=True)
+                ratios.append(gauge_ratio(desc_count, lim["description_max"]))
 
-            backend_val = st.text_area("Backend search terms", value=listing.get("backend_terms", ""), key="out_backend", height=70)
-            backend_count = byte_len(backend_val)
-            st.markdown(gauge_badge(backend_count, lim["backend_max_bytes"], "bytes"), unsafe_allow_html=True)
-            st.caption("Backend terms are indexed by byte length, not character count.")
-            ratios.append(gauge_ratio(backend_count, lim["backend_max_bytes"]))
+                backend_val = st.text_area("Backend search terms", value=listing.get("backend_terms", ""), key="out_backend", height=70)
+                backend_count = byte_len(backend_val)
+                st.markdown(gauge_badge(backend_count, lim["backend_max_bytes"], "bytes"), unsafe_allow_html=True)
+                st.caption("Backend terms are indexed by byte length, not character count.")
+                ratios.append(gauge_ratio(backend_count, lim["backend_max_bytes"]))
 
-            grade, grade_msg = compute_grade(ratios)
-            st.markdown(
-                f'<div style="display:flex;align-items:center;gap:12px;margin-top:8px;">'
-                f'<div class="crGradeCircle">{grade}</div>'
-                f'<div style="font-size:13px;color:#444;">{grade_msg}</div></div>',
-                unsafe_allow_html=True,
-            )
+                grade, grade_msg = compute_grade(ratios)
+                st.markdown(
+                    f'<div class="crGradeCard">'
+                    f'<div class="crGradeCircle">{grade}</div>'
+                    f'<div class="crMsg"><b>Listing health</b>{grade_msg}</div></div>',
+                    unsafe_allow_html=True,
+                )
 
         if st.session_state.history:
-            st.markdown("---")
-            st.markdown("**Previous versions**")
-            for i, entry in enumerate(st.session_state.history):
-                with st.expander(f"Version saved {entry['stamp']}"):
-                    d = entry["data"]
-                    st.text_area("Title", value=d.get("title", ""), key=f"hist_title_{i}", height=60, disabled=True)
-                    for j, b in enumerate(d.get("bullets", [])):
-                        st.text_area(f"Bullet {j+1}", value=b, key=f"hist_bullet_{i}_{j}", height=60, disabled=True)
-                    st.text_area("Description", value=d.get("description", ""), key=f"hist_desc_{i}", height=120, disabled=True)
-                    st.text_area("Backend terms", value=d.get("backend_terms", ""), key=f"hist_backend_{i}", height=60, disabled=True)
-            if st.button("Clear history"):
-                st.session_state.history = []
-                st.rerun()
+            hist_card = st.container(border=True)
+            with hist_card:
+                st.markdown('<p class="crSection">Previous versions</p>', unsafe_allow_html=True)
+                for i, entry in enumerate(st.session_state.history):
+                    with st.expander(f"Version saved {entry['stamp']}"):
+                        d = entry["data"]
+                        st.text_area("Title", value=d.get("title", ""), key=f"hist_title_{i}", height=60, disabled=True)
+                        for j, b in enumerate(d.get("bullets", [])):
+                            st.text_area(f"Bullet {j+1}", value=b, key=f"hist_bullet_{i}_{j}", height=60, disabled=True)
+                        st.text_area("Description", value=d.get("description", ""), key=f"hist_desc_{i}", height=120, disabled=True)
+                        st.text_area("Backend terms", value=d.get("backend_terms", ""), key=f"hist_backend_{i}", height=60, disabled=True)
+                if st.button("Clear history"):
+                    st.session_state.history = []
+                    st.rerun()
+
 
 # ===========================================================================
 # IMAGE HELPERS
@@ -502,6 +590,21 @@ def detect_theme(selected, brand, category, bullets_text, description_text, titl
     if category == "electronics":
         return "tech"
     return "general"
+
+
+def detect_persona(selected, theme_key, brand, category, bullets_text, description_text, title_text, extra_text):
+    if selected != "auto":
+        return selected
+    if theme_key in ("baby", "baby_swim"):
+        return "baby"
+    blob = " ".join([brand, category, bullets_text, description_text, title_text, extra_text]).lower()
+    if re.search(r"\b(men|mens|men's|man|male|for him|gentlemen)\b", blob):
+        return "man"
+    if re.search(r"\b(women|womens|women's|woman|female|for her|ladies)\b", blob):
+        return "woman"
+    if category == "babypet" and theme_key in ("baby", "baby_swim"):
+        return "baby"
+    return "adult"
 
 
 def draw_motif(base, theme_key, opacity):
@@ -708,13 +811,96 @@ def draw_specs_infographic(cutout, spec_items, theme, brand, packsize, theme_key
     return canvas
 
 
-def draw_lifestyle_graphic(cutout, tagline, theme, theme_key):
+def draw_baby_silhouette(d, cx, cy, scale, color):
+    head_r = 40 * scale
+    d.ellipse([cx - head_r, cy - 2.6 * head_r, cx + head_r, cy - 0.6 * head_r], fill=color)
+    body_w, body_h = 92 * scale, 74 * scale
+    body_top = cy - 0.6 * head_r
+    d.rounded_rectangle([cx - body_w / 2, body_top, cx + body_w / 2, body_top + body_h], radius=30 * scale, fill=color)
+    leg_r = 22 * scale
+    d.ellipse([cx - body_w / 2 - 4 * scale, body_top + body_h - leg_r, cx - body_w / 2 + leg_r * 1.6, body_top + body_h + leg_r], fill=color)
+    d.ellipse([cx + body_w / 2 - leg_r * 1.6, body_top + body_h - leg_r, cx + body_w / 2 + 4 * scale, body_top + body_h + leg_r], fill=color)
+    arm_r = 16 * scale
+    d.ellipse([cx - body_w / 2 - arm_r * 1.3, body_top + 10 * scale, cx - body_w / 2 + arm_r * 0.4, body_top + 10 * scale + arm_r * 2], fill=color)
+    d.ellipse([cx + body_w / 2 - arm_r * 0.4, body_top + 10 * scale, cx + body_w / 2 + arm_r * 1.3, body_top + 10 * scale + arm_r * 2], fill=color)
+
+
+def draw_adult_silhouette(d, cx, top_y, scale, color, gender="neutral"):
+    head_r = 46 * scale
+    head_cy = top_y + head_r
+    if gender == "woman":
+        hair_w = head_r * 1.35
+        d.ellipse([cx - hair_w, head_cy - head_r * 0.5, cx + hair_w, head_cy + head_r * 2.0], fill=color)
+    d.ellipse([cx - head_r, head_cy - head_r, cx + head_r, head_cy + head_r], fill=color)
+
+    torso_top = head_cy + head_r * 0.85
+    shoulder_w = (100 if gender == "woman" else 118) * scale
+    waist_w = 66 * scale
+    torso_h = 195 * scale
+    d.polygon([
+        (cx - shoulder_w / 2, torso_top),
+        (cx + shoulder_w / 2, torso_top),
+        (cx + waist_w / 2, torso_top + torso_h),
+        (cx - waist_w / 2, torso_top + torso_h),
+    ], fill=color)
+
+    arm_w = 26 * scale
+    arm_h = 150 * scale
+    d.rounded_rectangle([cx - shoulder_w / 2 - arm_w * 0.6, torso_top + 10 * scale,
+                          cx - shoulder_w / 2 + arm_w * 0.5, torso_top + 10 * scale + arm_h],
+                         radius=arm_w / 2, fill=color)
+    d.rounded_rectangle([cx + shoulder_w / 2 - arm_w * 0.5, torso_top + 10 * scale,
+                          cx + shoulder_w / 2 + arm_w * 0.6, torso_top + 10 * scale + arm_h],
+                         radius=arm_w / 2, fill=color)
+
+    leg_top = torso_top + torso_h
+    leg_w = waist_w / 2 - 6 * scale
+    leg_h = 175 * scale
+    d.rounded_rectangle([cx - waist_w / 2, leg_top, cx - waist_w / 2 + leg_w, leg_top + leg_h], radius=leg_w / 2, fill=color)
+    d.rounded_rectangle([cx + waist_w / 2 - leg_w, leg_top, cx + waist_w / 2, leg_top + leg_h], radius=leg_w / 2, fill=color)
+    return leg_top + leg_h
+
+
+def draw_person(canvas_rgba, S, persona_key):
+    if persona_key == "none":
+        return
+    layer = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+    color = (255, 255, 255, 200)
+    scale = S / 1400
+
+    if persona_key == "baby":
+        cx = S * 0.20
+        cy = S * 0.78
+        draw_baby_silhouette(d, cx, cy, scale * 1.4, color)
+    else:
+        gender = persona_key if persona_key in ("man", "woman") else "neutral"
+        cx = S * 0.16
+        top_y = S * 0.34
+        draw_adult_silhouette(d, cx, top_y, scale, color, gender)
+
+    canvas_rgba.alpha_composite(layer)
+
+
+def draw_ground_band(canvas_rgba, S, theme):
+    band = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    bd = ImageDraw.Draw(band)
+    dark = mix(theme["primary"], (0, 0, 0), 0.35)
+    bd.rectangle([0, S * 0.82, S, S], fill=dark + (60,))
+    canvas_rgba.alpha_composite(band)
+
+
+
+def draw_lifestyle_graphic(cutout, tagline, theme, theme_key, persona_key="adult"):
     S = 2000
     canvas = diagonal_gradient(S, theme["primary"], theme["secondary"]).convert("RGBA")
     draw_motif(canvas, theme_key, 0.22)
+    if theme_key in ("tech", "beauty", "fitness", "general"):
+        draw_ground_band(canvas, S, theme)
+    draw_person(canvas, S, persona_key)
     canvas = canvas.convert("RGB")
 
-    paste_product(canvas, cutout, S / 2, S * 0.46, S * 0.62, S * 0.62)
+    paste_product(canvas, cutout, S / 2, S * 0.5, S * 0.56, S * 0.56)
     d = ImageDraw.Draw(canvas)
 
     banner_h = S * 0.14
@@ -766,21 +952,28 @@ with tab_imagery:
     left, right = st.columns([2, 3], gap="large")
 
     with left:
-        st.subheader("Product imagery")
-        raw_file = st.file_uploader("Raw product photo", type=["png", "jpg", "jpeg", "webp"])
-        sku_input = st.text_input("SKU / ASIN (optional, used for filenames)", key="sku_input")
-        theme_choice = st.selectbox(
-            "Imagery theme", options=list(THEME_LABELS.keys()),
-            format_func=lambda k: THEME_LABELS[k], key="theme_choice",
-        )
-        st.caption(
-            "Works best when the raw photo already has a fairly plain, light background — the tool "
-            "auto-detects and clears it. Busy scenes may need manual cleanup first."
-        )
-        generate_images_clicked = st.button(
-            "Generate image set", type="primary", use_container_width=True,
-            disabled=not (client and raw_file),
-        )
+        img_card = st.container(border=True)
+        with img_card:
+            st.markdown('<p class="crSection">Product imagery</p>', unsafe_allow_html=True)
+            raw_file = st.file_uploader("Raw product photo", type=["png", "jpg", "jpeg", "webp"])
+            sku_input = st.text_input("SKU / ASIN (optional, used for filenames)", key="sku_input")
+            theme_choice = st.selectbox(
+                "Imagery theme", options=list(THEME_LABELS.keys()),
+                format_func=lambda k: THEME_LABELS[k], key="theme_choice",
+            )
+            persona_choice = st.selectbox(
+                "Lifestyle figure", options=list(PERSONA_LABELS.keys()),
+                format_func=lambda k: PERSONA_LABELS[k], key="persona_choice",
+                help="Adds a simple stylized human silhouette to the lifestyle-style graphic — not a photoreal person.",
+            )
+            st.caption(
+                "Works best when the raw photo already has a fairly plain, light background — the tool "
+                "auto-detects and clears it. Busy scenes may need manual cleanup first."
+            )
+            generate_images_clicked = st.button(
+                "Generate image set", type="primary", use_container_width=True,
+                disabled=not (client and raw_file),
+            )
 
     if generate_images_clicked and raw_file:
         with st.spinner("Generating image set..."):
@@ -799,6 +992,7 @@ with tab_imagery:
                 extra_val = st.session_state.get("extra_keywords", "")
 
                 theme_key = detect_theme(theme_choice, brand_val, category_val, bullets_text, description_text, title_text, extra_val)
+                persona_key = detect_persona(persona_choice, theme_key, brand_val, category_val, bullets_text, description_text, title_text, extra_val)
 
                 content_prompt = f"""You are writing short on-image copy for Amazon secondary product images (infographics, not the compliant main image). Given this product context, respond with ONLY minified JSON, no markdown, matching exactly:
 {{"feature_callouts":["...","...","...","...","...","..."],"spec_items":[{{"label":"...","value":"..."}},{{"label":"...","value":"..."}},{{"label":"...","value":"..."}},{{"label":"...","value":"..."}},{{"label":"...","value":"..."}},{{"label":"...","value":"..."}}],"supporting_line":"...","lifestyle_tagline":"...","size_guide_label":"..."}}
@@ -813,9 +1007,10 @@ Description: {description_text or '(none provided)'}"""
 
                 try:
                     content = call_claude_json(content_prompt)
-                except Exception:
+                except Exception as e:
                     content = {"feature_callouts": [], "spec_items": [], "supporting_line": "",
                                "lifestyle_tagline": "", "size_guide_label": ""}
+                    st.warning(f"Using generic placeholder text on the infographics \u2014 {friendly_error_message(e)}")
 
                 sku = re.sub(r"[^a-zA-Z0-9]", "", sku_input) or "product"
                 theme = cutout["theme"]
@@ -830,8 +1025,8 @@ Description: {description_text or '(none provided)'}"""
                     {"label": "Spec infographic", "code": "PT02", "note": "Secondary slot.",
                      "canvas": draw_specs_infographic(cutout, content.get("spec_items"), theme, brand_val, packsize_val, theme_key)},
                     {"label": "Lifestyle-style graphic", "code": "PT03",
-                     "note": "Stylized backdrop, not a photoreal scene \u2014 secondary slot.",
-                     "canvas": draw_lifestyle_graphic(cutout, content.get("lifestyle_tagline"), theme, theme_key)},
+                     "note": "Stylized backdrop with a simple human silhouette, not a photoreal scene \u2014 secondary slot.",
+                     "canvas": draw_lifestyle_graphic(cutout, content.get("lifestyle_tagline"), theme, theme_key, persona_key)},
                     {"label": "Size guide", "code": "PT04", "note": "Secondary slot.",
                      "canvas": draw_size_guide(cutout, content.get("size_guide_label"), packsize_val, theme)},
                 ]
@@ -840,39 +1035,44 @@ Description: {description_text or '(none provided)'}"""
 
                 st.session_state.imagery = images
             except Exception as e:
-                st.error(f"Could not generate the image set. {e}")
+                st.error(f"Could not generate the image set. {friendly_error_message(e)}")
 
     with right:
-        images = st.session_state.imagery
-        if not images:
-            st.info(
-                "Upload a raw product photo and click Generate image set. You'll get a compliant "
-                "white-background main image plus four secondary images (feature infographic, spec "
-                "infographic, lifestyle-style graphic, size guide), themed to your product's own colors "
-                "and ready to download."
-            )
-        else:
-            zip_buf = io.BytesIO()
-            with zipfile.ZipFile(zip_buf, "w") as zf:
-                for item in images:
-                    b = io.BytesIO()
-                    item["canvas"].save(b, format="JPEG", quality=92)
-                    zf.writestr(item["filename"], b.getvalue())
-            st.download_button(
-                "Download all (.zip)", data=zip_buf.getvalue(),
-                file_name="amazon_image_set.zip", mime="application/zip",
-                use_container_width=True,
-            )
+        out_img_card = st.container(border=True)
+        with out_img_card:
+            st.markdown('<p class="crSection">Generated set</p>', unsafe_allow_html=True)
+            images = st.session_state.imagery
+            if not images:
+                st.info(
+                    "Upload a raw product photo and click Generate image set. You'll get a compliant "
+                    "white-background main image plus four secondary images (feature infographic, spec "
+                    "infographic, lifestyle-style graphic, size guide), themed to your product's own colors "
+                    "and ready to download."
+                )
+            else:
+                zip_buf = io.BytesIO()
+                with zipfile.ZipFile(zip_buf, "w") as zf:
+                    for item in images:
+                        b = io.BytesIO()
+                        item["canvas"].save(b, format="JPEG", quality=92)
+                        zf.writestr(item["filename"], b.getvalue())
+                st.download_button(
+                    "Download all (.zip)", data=zip_buf.getvalue(),
+                    file_name="amazon_image_set.zip", mime="application/zip",
+                    use_container_width=True,
+                )
 
-            cols = st.columns(3)
-            for i, item in enumerate(images):
-                with cols[i % 3]:
-                    st.image(item["canvas"], use_container_width=True)
-                    st.markdown(f"**{item['label']}**")
-                    st.caption(item["note"])
-                    buf = io.BytesIO()
-                    item["canvas"].save(buf, format="JPEG", quality=92)
-                    st.download_button(
-                        "Download", data=buf.getvalue(), file_name=item["filename"],
-                        mime="image/jpeg", key=f"dl_{i}", use_container_width=True,
-                    )
+                cols = st.columns(3)
+                for i, item in enumerate(images):
+                    with cols[i % 3]:
+                        cell = st.container(border=True)
+                        with cell:
+                            st.image(item["canvas"], use_container_width=True)
+                            st.markdown(f"**{item['label']}**")
+                            st.caption(item["note"])
+                            buf = io.BytesIO()
+                            item["canvas"].save(buf, format="JPEG", quality=92)
+                            st.download_button(
+                                "Download", data=buf.getvalue(), file_name=item["filename"],
+                                mime="image/jpeg", key=f"dl_{i}", use_container_width=True,
+                            )
